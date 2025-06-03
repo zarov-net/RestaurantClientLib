@@ -1,194 +1,225 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Npgsql;
+using RestaurantClientLib;
+using RestaurantClientLib.Grpc;
+using RestaurantClientLib.Interfaces;
+using RestaurantClientLib.Models;
+using Dish = RestaurantClientLib.Grpc.Dish;
+using OrderItem = RestaurantClientLib.Grpc.OrderItem;
 
 class Program
 {
     private static ILogger<Program> _logger;
     private static IConfiguration _configuration;
-
+    
     static async Task Main(string[] args)
     {
-        // Настройка конфигурации
+        // Настройка конфигурации и логгера
+        ConfigureServices();
+        
+        try
+        {
+            await InitializeDatabase();
+            
+            // Выбираем реализацию клиента (HTTP или gRPC)
+            var useGrpc = AskForClientType();
+            IRestaurantClient client = CreateClient(useGrpc);
+            
+            // Получаем список блюд
+            var dishes = await GetDishesAsync(client);
+            await SaveDishesToDatabase(dishes);
+            PrintDishes(dishes);
+            
+            // Создаем и отправляем заказ
+            var order = await CreateOrderAsync(dishes);
+            await PlaceOrderAsync(client, order);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Произошла ошибка");
+            Console.WriteLine($"Ошибка: {ex.Message}");
+        }
+    }
+
+    private static void ConfigureServices()
+    {
         _configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
             .AddJsonFile("appsettings.json")
             .Build();
-
-        // Настройка логгера
+            
         var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder
                 .AddConsole()
                 .AddFile(string.Format(
-                    _configuration["Logging:LogFilePath"],
+                    _configuration["Logging:LogFilePath"], 
                     DateTime.Now));
         });
-
+        
         _logger = loggerFactory.CreateLogger<Program>();
+    }
 
-        try
+    private static bool AskForClientType()
+    {
+        Console.WriteLine("Выберите тип клиента (1 - HTTP, 2 - gRPC):");
+        var input = Console.ReadLine();
+        return input == "2";
+    }
+
+    private static IRestaurantClient CreateClient(bool useGrpc)
+    {
+        if (useGrpc)
         {
-            await InitializeDatabase();
-
-            // Используем HTTP клиент (можно заменить на gRPC)
-            var client = new RestaurantClient(
+            return new RestaurantGrpcClient(_configuration["ApiSettings:GrpcUrl"]);
+        }
+        else
+        {
+            return new RestaurantHttpClient(
                 _configuration["ApiSettings:BaseUrl"],
                 _configuration["ApiSettings:Username"],
                 _configuration["ApiSettings:Password"]);
-
-            // Получаем блюда
-            List<Dish> dishes;
-            try
-            {
-                dishes = await client.GetDishesAsync();
-                await SaveDishesToDatabase(dishes);
-
-                Console.WriteLine("Список блюд:");
-                foreach (var dish in dishes)
-                {
-                    Console.WriteLine($"{dish.Name} – {dish.Code} – {dish.Price}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Ошибка: {ex.Message}");
-                _logger.LogError(ex, "Ошибка при получении блюд");
-                return;
-            }
-
-            // Создаем заказ
-            var order = new Order();
-            bool inputValid = false;
-
-            while (!inputValid)
-            {
-                Console.WriteLine("\nВведите заказ в формате: Код1:Количество1;Код2:Количество2;...");
-                var input = Console.ReadLine();
-
-                try
-                {
-                    ParseOrderInput(input, dishes, order);
-                    inputValid = true;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Ошибка: {ex.Message}");
-                    Console.WriteLine("Попробуйте еще раз.");
-                }
-            }
-
-            // Отправляем заказ
-            try
-            {
-                var success = await client.PlaceOrderAsync(order);
-                Console.WriteLine("УСПЕХ");
-                _logger.LogInformation("Заказ успешно отправлен");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Ошибка: {ex.Message}");
-                _logger.LogError(ex, "Ошибка при отправке заказа");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogCritical(ex, "Критическая ошибка в приложении");
-            Console.WriteLine($"Произошла критическая ошибка: {ex.Message}");
         }
     }
 
     private static async Task InitializeDatabase()
     {
         var connectionString = _configuration.GetConnectionString("PostgreSQL");
+        
+        using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        
+        var createTableCmd = new NpgsqlCommand(@"
+            CREATE TABLE IF NOT EXISTS dishes (
+                code VARCHAR(50) PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                price DECIMAL(10,2) NOT NULL
+            )", connection);
+            
+        await createTableCmd.ExecuteNonQueryAsync();
+        _logger.LogInformation("База данных инициализирована");
+    }
 
-        using (var connection = new NpgsqlConnection(connectionString))
+    private static async Task<Dish[]> GetDishesAsync(IRestaurantClient client)
+    {
+        try
         {
-            await connection.OpenAsync();
-
-            // Создаем базу данных, если не существует
-            var checkDbCmd = new NpgsqlCommand(
-                "SELECT 1 FROM pg_database WHERE datname='restaurant_db'", connection);
-            var dbExists = await checkDbCmd.ExecuteScalarAsync() != null;
-
-            if (!dbExists)
-            {
-                var createDbCmd = new NpgsqlCommand(
-                    "CREATE DATABASE restaurant_db", connection);
-                await createDbCmd.ExecuteNonQueryAsync();
-                _logger.LogInformation("База данных создана");
-            }
-
-            // Создаем таблицу dishes, если не существует
-            var createTableCmd = new NpgsqlCommand(@"
-                CREATE TABLE IF NOT EXISTS dishes (
-                    code VARCHAR(50) PRIMARY KEY,
-                    name VARCHAR(100) NOT NULL,
-                    price DECIMAL(10,2) NOT NULL
-                )", connection);
-
-            await createTableCmd.ExecuteNonQueryAsync();
-            _logger.LogInformation("Таблица dishes проверена/создана");
+            var dishes = await client.GetDishesAsync();
+            _logger.LogInformation("Получен список блюд");
+            return dishes;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка при получении блюд");
+            throw;
         }
     }
 
     private static async Task SaveDishesToDatabase(List<Dish> dishes)
     {
         var connectionString = _configuration.GetConnectionString("PostgreSQL");
-
-        using (var connection = new NpgsqlConnection(connectionString))
+        
+        using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        
+        // Очищаем таблицу перед вставкой
+        await new NpgsqlCommand("TRUNCATE TABLE dishes", connection)
+            .ExecuteNonQueryAsync();
+        
+        // Вставляем данные
+        foreach (var dish in dishes)
         {
-            await connection.OpenAsync();
-
-            // Очищаем таблицу перед вставкой новых данных
-            var clearTableCmd = new NpgsqlCommand("TRUNCATE TABLE dishes", connection);
-            await clearTableCmd.ExecuteNonQueryAsync();
-
-            // Вставляем данные
-            foreach (var dish in dishes)
-            {
-                var insertCmd = new NpgsqlCommand(
-                    "INSERT INTO dishes (code, name, price) VALUES (@code, @name, @price)",
-                    connection);
-
-                insertCmd.Parameters.AddWithValue("code", dish.Code);
-                insertCmd.Parameters.AddWithValue("name", dish.Name);
-                insertCmd.Parameters.AddWithValue("price", dish.Price);
-
-                await insertCmd.ExecuteNonQueryAsync();
-            }
-
-            _logger.LogInformation($"Добавлено {dishes.Count} блюд в базу данных");
+            var cmd = new NpgsqlCommand(
+                "INSERT INTO dishes (code, name, price) VALUES (@code, @name, @price)", 
+                connection);
+                
+            cmd.Parameters.AddWithValue("code", dish.Code);
+            cmd.Parameters.AddWithValue("name", dish.Name);
+            cmd.Parameters.AddWithValue("price", dish.Price);
+            
+            await cmd.ExecuteNonQueryAsync();
         }
+        
+        _logger.LogInformation($"Сохранено {dishes.Count} блюд в БД");
+    }
+
+    private static void PrintDishes(Dish[] dishes)
+    {
+        Console.WriteLine("\nСписок блюд:");
+        foreach (var dish in dishes)
+        {
+            Console.WriteLine($"{dish.Name} – {dish.Code} – {dish.Price}");
+        }
+    }
+
+    private static async Task<Order> CreateOrderAsync(List<Dish> dishes)
+    {
+        var order = new Order();
+        bool inputValid = false;
+        
+        while (!inputValid)
+        {
+            Console.WriteLine("\nВведите заказ в формате: Код1:Количество1;Код2:Количество2;...");
+            var input = Console.ReadLine();
+            
+            try
+            {
+                ParseOrderInput(input, dishes, order);
+                inputValid = true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка: {ex.Message}");
+            }
+        }
+        
+        return order;
     }
 
     private static void ParseOrderInput(string input, List<Dish> dishes, Order order)
     {
         if (string.IsNullOrWhiteSpace(input))
             throw new Exception("Ввод не может быть пустым");
-
-        var items = input.Split(';');
+            
+        var items = input.Split(';', StringSplitOptions.RemoveEmptyEntries);
         if (items.Length == 0)
             throw new Exception("Неверный формат ввода");
-
+            
         foreach (var item in items)
         {
             var parts = item.Split(':');
             if (parts.Length != 2)
                 throw new Exception($"Неверный формат элемента: {item}");
-
+                
             var code = parts[0].Trim();
             if (!int.TryParse(parts[1].Trim(), out var quantity) || quantity <= 0)
                 throw new Exception($"Некорректное количество для кода {code}");
-
+                
             if (!dishes.Any(d => d.Code == code))
                 throw new Exception($"Блюдо с кодом {code} не найдено");
-
+                
             order.Items.Add(new OrderItem
             {
                 DishCode = code,
                 Quantity = quantity
             });
+        }
+    }
+
+    private static async Task PlaceOrderAsync(IRestaurantClient client, Order order)
+    {
+        try
+        {
+            await client.PlaceOrderAsync(order);
+            Console.WriteLine("УСПЕХ");
+            _logger.LogInformation("Заказ успешно отправлен");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка: {ex.Message}");
+            _logger.LogError(ex, "Ошибка при отправке заказа");
+            throw;
         }
     }
 }
